@@ -195,7 +195,7 @@ def sub_optimal_grouping(
         top_k: Keep only top_k tokens before grouping
 
     Returns:
-        List of groups, each group is a list of token IDs
+        groups : List of groups, each group is a list of token IDs
     """
     assert len(token_ids) == len(probs)
 
@@ -219,7 +219,7 @@ def sub_optimal_grouping(
     if len(sorted_probs) < u:
         raise ValueError(f"Not enough tokens ({len(sorted_probs)}) for {u} groups")
 
-    G = [[] for _ in range(u)]
+    groups = [[] for _ in range(u)]
     remaining_sum = sum(sorted_probs)  # should be 1, but I kept exact value
 
     # Build first u-1 groups with equal probability
@@ -231,7 +231,7 @@ def sub_optimal_grouping(
         current_first_index = sorted_indices.pop(0)
         current_max_prob = sorted_probs.pop(0)
 
-        G[i].append(current_first_index)
+        groups[i].append(current_first_index)
         group_sum = current_max_prob
         remaining_sum -= current_max_prob
 
@@ -241,7 +241,7 @@ def sub_optimal_grouping(
             prob_token = sorted_probs[idx_token]
 
             if prob_token - epsilon < epsilon:
-                G[i].append(sorted_indices.pop(idx_token))
+                groups[i].append(sorted_indices.pop(idx_token))
                 group_sum += sorted_probs.pop(idx_token)
                 remaining_sum -= prob_token
             else:
@@ -249,69 +249,11 @@ def sub_optimal_grouping(
         mean = remaining_sum / (u - (i + 1))
 
     # Last group gets remaining tokens
-    G[-1].extend(sorted_indices)
-    return G
+    groups[-1].extend(sorted_indices)
+    return groups
 
 
-def build_full_tree(p_LM: torch.Tensor, top_k: int) -> list[ADGTreeNode]:
-    """
-    Unfolds the complete ADG recursion tree.
-    Returns a list of ADGTreeNode with eta_tilde RELATIVE to parent.
-    At level 0, eta_tilde = mass(group) / total_mass.
-    """
-    token_ids = torch.arange(len(p_LM))  # c'est un tenseur
-    groups_level_0 = sub_optimal_grouping(
-        token_ids, p_LM, top_k
-    )  # c'est une liste de listes d'index, pas un tenseur
 
-    # total mass c'est la mass des topk...
-    total_mass = sum(p_LM[t].item() for g in groups_level_0 for t in g)
-
-    def build_node(current_group, parent_mass):
-        current_group_ids = torch.tensor(current_group)  # c'est un tenseur
-        current_mass = p_LM[current_group_ids].sum().item()  # c'est un tenseur
-
-        current_eta = current_mass / parent_mass if parent_mass > 0 else 0.0
-
-        group_probs = p_LM[current_group_ids]
-        group_probs = group_probs / group_probs.sum()  # group_probs est renormalisé
-
-        sub_groups = sub_optimal_grouping(current_group_ids, group_probs, top_k=None)
-
-        if len(sub_groups) == 1:
-            return ADGTreeNode(
-                eta_tilde=current_eta
-            )  # on a mis field(default_factory=list) donc [] est ajouté auto
-        else:
-            children = [build_node(g, current_mass) for g in sub_groups]
-            return ADGTreeNode(eta_tilde=current_eta, children=children)
-
-    return [build_node(g, total_mass) for g in groups_level_0]
-
-
-def compute_D_KL(tree: list[ADGTreeNode]) -> float:
-    """
-    D_KL(p_LM || q_ADG) via leaf decomposition.
-    D_KL = sum_f eta_f * log(eta_f / U_f)
-    """
-    total_DKL = 0
-
-    def go_to_leaf(node, eta_path, u_path):
-        current_eta = node.eta_tilde * eta_path
-        if len(node.children) == 0:
-            if current_eta > 0 and u_path > 0:
-                return current_eta * math.log(current_eta / u_path)
-            return 0.0
-        else:
-            n = len(node.children)
-            return sum(
-                go_to_leaf(child, current_eta, u_path / n) for child in node.children
-            )
-
-    n0 = len(tree)
-    for node in tree:
-        total_DKL += go_to_leaf(node, 1.0, 1.0 / n0)
-    return total_DKL
 
 
 # ===================================================================================
@@ -349,7 +291,6 @@ def get_next_token_probs(
     assert config.temperature > 0, "Temperature must be strictly positive"
 
     if kv_cache is None:
-
         tensor_input = torch.tensor([context_ids]).to(config.device)
         with torch.no_grad():
             out = config.model(tensor_input, use_cache=True)
@@ -357,7 +298,6 @@ def get_next_token_probs(
         new_kv_cache = out.past_key_values
 
     else:
-
         tensor_input = torch.tensor([[context_ids[-1]]]).to(config.device)
         with torch.no_grad():
             out = config.model(tensor_input, past_key_values=kv_cache, use_cache=True)
