@@ -119,7 +119,7 @@ class GeneratedText:
 class GroupSelectionResult:
     bits_encoded: list[int]
     tree_path: list[ADGGroup]
-    candidate_ids: torch.Tensor  # tokens du groupe terminal (où échantillonner)
+    candidate_ids: list[int]
     probs: torch.Tensor  # leurs probas normalisées
     bit_index: int  # nouvelle position dans le bit_list
     p_LM: torch.Tensor  # distribution complète (pour pouvoir calculer log_p_LM)
@@ -181,35 +181,19 @@ def _find_nearest_prob_idx(sorted_probs: list[float], epsilon: float) -> int:
     return high_idx
 
 
-def sub_optimal_grouping(
-    token_ids: torch.Tensor, probs: torch.Tensor, top_k: int
-) -> list[list[int]]:
+def sub_optimal_grouping(id2prob: dict[int, float]) -> list[list[int]]:
+    """Group tokens into u = 2^floor(-log2(p_max)) groups of near-equal probability (Algorithm 1, Zhang et al. 2021).
+
+    Receives id2prob: token_id -> probability, normalized (sum ≈ 1).
     """
-    Implements Algorithm 1 from Zhang et al. (2021).
-
-    Groups tokens into u = 2^floor(-log2(p_max)) groups of approximately equal probability.
-
-    Args:
-        token_ids: Token indices
-        probs: Probability distribution (must sum to 1)
-        top_k: Keep only top_k tokens before grouping
-
-    Returns:
-        groups : List of groups, each group is a list of token IDs
-    """
-    assert len(token_ids) == len(probs)
-
-    # Top-k filtering + sort
-    if top_k is not None and top_k < len(probs):
-        top_probs, top_indices = torch.topk(probs, top_k)
-        token_ids = token_ids[top_indices]
-        p_topk = top_probs / top_probs.sum()
-    else:
-        p_topk = probs
-
-    sorted_probs, sort_order = torch.sort(p_topk, descending=True)
-    sorted_probs = sorted_probs.tolist()
-    sorted_indices = token_ids[sort_order].tolist()
+    p_total = sum(id2prob.values())
+    assert math.isclose(p_total, 1.0, abs_tol=1e-6), (
+        f"id2prob must sum to 1, got {p_total}"
+    )
+    
+    sorted_items = sorted(id2prob.items(), key=lambda kv: (-kv[1], kv[0]))
+    sorted_indices = [tok for tok, _ in sorted_items]
+    sorted_probs = [p for _, p in sorted_items]
 
     # Compute number of groups : u
     p_max = sorted_probs[0]
@@ -251,9 +235,6 @@ def sub_optimal_grouping(
     # Last group gets remaining tokens
     groups[-1].extend(sorted_indices)
     return groups
-
-
-
 
 
 # ===================================================================================
@@ -331,30 +312,27 @@ def recursive_group_selection(
     """
     # Initial grouping
     p_LM, new_kv_cache, raw_logits = get_next_token_probs(context_ids, config, kv_cache=kv_cache)
-    all_vocab_ids = torch.arange(len(p_LM)).to(config.device)
+
+    # top_ids sont des token_ids : p_LM couvre toutle vocabulaire (index = id)
+    # id2prob est bien un dict aux probabs normalisées. 
+    top_probs, top_ids = torch.topk(p_LM, config.top_k)
+    ids = top_ids.tolist()
+    vals = top_probs.tolist()          # float64 Python
+    total = sum(vals)
+    id2prob = {t: v / total for t, v in zip(ids, vals)}
+    # On passe en CPU
+     
     bits_encoded = []
     current_tree_path = []
-    groups = sub_optimal_grouping(all_vocab_ids, p_LM, config.top_k)
+
+    groups = sub_optimal_grouping(id2prob)
     nb_bits = int(math.log2(len(groups)))
 
-    # on calcule la masse des top_k tokens dans groups 
-    all_ids = [idx for group in groups for idx in group]
-    parent_mass = p_LM[all_ids].sum().item()
-
-    topk_ids = torch.tensor(all_ids).to(config.device)
-    probs = p_LM[topk_ids]
-    probs = probs / probs.sum()
-
-    # Recursive selection until group is indivisible
-    selected_group_ids = topk_ids
-    while nb_bits > 0:  # tant qu'il arrive à faire des sous groupes...
+    while nb_bits > 0:   
+        # attention len(bit_needed) peut etre < nb_bits (si il ne reste plus assez de bits à insérer)
         bits_needed = bit_list[bit_index : bit_index + nb_bits]
-
-        # On met à jour avant le padding éventuel
-        bits_encoded.extend(bits_needed)
-
-        # On gère le padding en fin de message
-        if len(bits_needed) < nb_bits:
+        bits_encoded.extend(bits_needed) # On met à jour avant le padding éventuel
+        if len(bits_needed) < nb_bits:   # On gère le padding en fin de message
             bits_needed += [0] * (nb_bits - len(bits_needed))
 
         # le numéro de groupe correspond aux bits à encoder
@@ -362,35 +340,33 @@ def recursive_group_selection(
         selected_group = groups[group_idx]
 
         # on calcule eta_tilde la masse relative du sous groupe selectionné.
-        selected_group_mass = p_LM[selected_group].sum().item()
-        eta_tilde = selected_group_mass/parent_mass
-
+        eta_tilde_selected_group = sum(id2prob[t] for t in selected_group)
+        
         current_tree_path.append(
             ADGGroup(
                 recursion_level=len(current_tree_path),
                 n_groups=len(groups),
                 group_idx=group_idx,
-                eta_tilde=eta_tilde,
+                eta_tilde=eta_tilde_selected_group,
             )
         )
 
-        parent_mass = selected_group_mass
-        selected_group_ids = torch.tensor(selected_group).to(config.device)
         bit_index += nb_bits
 
-        # on recalcule les probabilités locales normalisées.
-        probs = p_LM[selected_group_ids]
-        probs = probs / probs.sum()
-
-        groups = sub_optimal_grouping(
-            selected_group_ids, probs, top_k=None
-        )  # top_k déjà appliqué
+        # On recrée un dictionnaire normalisé. 
+        id2prob = {t: id2prob[t] / eta_tilde_selected_group  for t in selected_group}
+        groups = sub_optimal_grouping(id2prob)   
         nb_bits = int(math.log2(len(groups)))
+
+    #On rebascule le dernier groupe sur GPU pour le tirage
+    candidate_ids = list(id2prob.keys())
+    probs = torch.tensor([id2prob[t] for t in candidate_ids]).to(config.device)
+
 
     return GroupSelectionResult(
         bits_encoded=bits_encoded,
         tree_path=current_tree_path,
-        candidate_ids=selected_group_ids,
+        candidate_ids=candidate_ids,
         probs=probs,
         bit_index=bit_index,
         p_LM=p_LM,
@@ -435,8 +411,8 @@ def ADG_encode(
         result = recursive_group_selection(
             bit_list, bit_index, context_ids, config, kv_cache=kv_cache
         )
-
-        selected_id = result.candidate_ids[torch.multinomial(result.probs, 1)].item()
+        idx = torch.multinomial(result.probs, 1).item()
+        selected_id = result.candidate_ids[idx]
         log_p_LM = torch.log(result.p_LM[selected_id]).item()
         top_k_logits, top_k_ids = torch.topk(result.raw_logits, config.top_k)
 
@@ -495,16 +471,20 @@ def extract_bits_from_token(
     if p_LM is None:
         p_LM, kv_cache, _ = get_next_token_probs(context_ids, config, kv_cache=kv_cache)
 
+
+    top_probs, top_ids = torch.topk(p_LM, config.top_k)
+    ids = top_ids.tolist()
+    vals = top_probs.tolist()
+    total = sum(vals)
+    id2prob = {t: v / total for t, v in zip(ids, vals)}  
+
+
     tree_path = []
-
-    all_vocab_ids = torch.arange(len(p_LM)).to(config.device)
-    groups = sub_optimal_grouping(all_vocab_ids, p_LM, config.top_k)
+    bits = []       
+     
+    groups = sub_optimal_grouping(id2prob)
     nb_bits = int(math.log2(len(groups)))
-    bits = []
-
-    # on calcule la masse des top_k tokens dans groups  
-    all_ids = [idx for group in groups for idx in group]
-    parent_mass = p_LM[all_ids].sum().item()
+    
 
     while nb_bits > 0:
 
@@ -520,26 +500,22 @@ def extract_bits_from_token(
         bits.extend(int2bits(group_idx, nb_bits))
 
         # on identifie la liste des token dans le sous groupe
-        selected_group_ids = torch.tensor(groups[group_idx]).to(config.device)
+        selected_group =  groups[group_idx] 
 
         # C'est la masse du sous groupe
-        probs = p_LM[selected_group_ids]
+        eta_tilde_selected_group = sum(id2prob[t] for t in selected_group)
 
-        selected_group_mass = p_LM[selected_group_ids].sum().item()
-        eta_tilde = selected_group_mass / parent_mass
         tree_path.append(
             ADGGroup(
                 recursion_level=len(tree_path),
                 n_groups=len(groups),
                 group_idx=group_idx,
-                eta_tilde=eta_tilde,
+                eta_tilde=eta_tilde_selected_group,
             )
         )
-        probs = probs / probs.sum()  # probs est renormalisé donc interne au sous groupe
+        id2prob = {t: id2prob[t] / eta_tilde_selected_group for t in selected_group}
 
-        groups = sub_optimal_grouping(selected_group_ids, probs, top_k=None)
-        parent_mass = selected_group_mass
-
+        groups = sub_optimal_grouping(id2prob)
         nb_bits = int(math.log2(len(groups)))
 
     return bits, kv_cache, tree_path
