@@ -123,7 +123,7 @@ class GroupSelectionResult:
     probs: torch.Tensor  # leurs probas normalisées
     bit_index: int  # nouvelle position dans le bit_list
     p_LM: torch.Tensor  # distribution complète (pour pouvoir calculer log_p_LM)
-    past: Any  # past_key_values mis à jour
+    kv_cache: Any  # past_key_values mis à jour
     raw_logits: torch.Tensor
 
 
@@ -338,35 +338,35 @@ def load_model(model_name: str, device: torch.device):
 def get_next_token_probs(
     context_ids: list[int],
     config: ADGConfig,
-    past: Any = None,
+    kv_cache: Any = None,
 ) -> tuple[torch.Tensor, Any, torch.Tensor]:
     """
     Computes p_LM over vocabulary for next token.
-    If past is None: forward sur tout context_ids, retourne (p_LM, new_past).
-    Sinon: forward sur context_ids[-1] uniquement, en utilisant past, retourne (p_LM, new_past).
+    If kv_cache is None: forward sur tout context_ids, retourne (p_LM, new_kv_cache).
+    Sinon: forward sur context_ids[-1] uniquement, en utilisant kv_cache, retourne (p_LM, new_kv_cache).
     """
 
     assert config.temperature > 0, "Temperature must be strictly positive"
 
-    if past is None:
+    if kv_cache is None:
 
         tensor_input = torch.tensor([context_ids]).to(config.device)
         with torch.no_grad():
             out = config.model(tensor_input, use_cache=True)
         logits = out.logits
-        new_past = out.past_key_values
+        new_kv_cache = out.past_key_values
 
     else:
 
         tensor_input = torch.tensor([[context_ids[-1]]]).to(config.device)
         with torch.no_grad():
-            out = config.model(tensor_input, past_key_values=past, use_cache=True)
+            out = config.model(tensor_input, past_key_values=kv_cache, use_cache=True)
         logits = out.logits
-        new_past = out.past_key_values
+        new_kv_cache = out.past_key_values
 
     raw_logits = logits[0, -1, :]
     p_LM = F.softmax(raw_logits / config.temperature, dim=-1)
-    return p_LM, new_past, raw_logits
+    return p_LM, new_kv_cache, raw_logits
 
 
 def encode_prompt(prompt: str, config: ADGConfig) -> list[int]:
@@ -385,12 +385,12 @@ def recursive_group_selection(
     bit_index: int,
     context_ids: list[int],
     config: ADGConfig,
-    past=None,
+    kv_cache=None,
 ) -> GroupSelectionResult:
     """Route the next payload bits through the ADG group tree for one token.
     """
     # Initial grouping
-    p_LM, new_past, raw_logits = get_next_token_probs(context_ids, config, past=past)
+    p_LM, new_kv_cache, raw_logits = get_next_token_probs(context_ids, config, kv_cache=kv_cache)
     all_vocab_ids = torch.arange(len(p_LM)).to(config.device)
     bits_encoded = []
     current_tree_path = []
@@ -454,7 +454,7 @@ def recursive_group_selection(
         probs=probs,
         bit_index=bit_index,
         p_LM=p_LM,
-        past=new_past,
+        kv_cache=new_kv_cache,
         raw_logits=raw_logits,
     )
 
@@ -486,14 +486,14 @@ def ADG_encode(
     context_ids = list(prompt_tokens)  # copy: never mutate the caller's list
     stego_tokens = []
     token_infos = []
-    past = None
+    kv_cache = None
     stop_reason = (
         StopReason.BIT_BUDGET_REACHED
     )  # sera modifiée en cas d'échec du chargement du payload
 
     while bit_index < len(bit_list):
         result = recursive_group_selection(
-            bit_list, bit_index, context_ids, config, past=past
+            bit_list, bit_index, context_ids, config, kv_cache=kv_cache
         )
 
         selected_id = result.candidate_ids[torch.multinomial(result.probs, 1)].item()
@@ -515,7 +515,7 @@ def ADG_encode(
         stego_tokens.append(selected_id)
         context_ids.append(selected_id)
         bit_index = result.bit_index
-        past = result.past
+        kv_cache = result.kv_cache
 
         if selected_id in config.eos_token_ids:
             stop_reason = StopReason.EOS_EMITTED
@@ -546,14 +546,14 @@ def extract_bits_from_token(
     context_ids: list[int],
     config: ADGConfig,
     p_LM=None,
-    past=None,
+    kv_cache=None,
 ) -> tuple[list[int], Any, list[ADGGroup]]:
     """
     Inverse of recursive_group_selection.
     Extracts the bits encoded by a single token.
     """
     if p_LM is None:
-        p_LM, past, _ = get_next_token_probs(context_ids, config, past=past)
+        p_LM, kv_cache, _ = get_next_token_probs(context_ids, config, kv_cache=kv_cache)
 
     tree_path = []
 
@@ -602,7 +602,7 @@ def extract_bits_from_token(
 
         nb_bits = int(math.log2(len(groups)))
 
-    return bits, past, tree_path
+    return bits, kv_cache, tree_path
 
 
 def ADG_decode(
@@ -626,10 +626,10 @@ def ADG_decode(
     """
     context_ids = list(prompt_tokens)  # copy: never mutate the caller's list
     bits = []
-    past = None
+    kv_cache = None
     for token_id in stego_tokens:
-        new_bits, past, _ = extract_bits_from_token(
-            token_id, context_ids, config, past=past
+        new_bits, kv_cache, _ = extract_bits_from_token(
+            token_id, context_ids, config, kv_cache=kv_cache
         )
         bits.extend(new_bits)
         context_ids.append(token_id)
@@ -663,11 +663,11 @@ def ADG_generate_cover(
     bit_stream = []
     cover_tokens = []
     token_infos = []
-    past = None
+    kv_cache = None
 
     stop_reason = StopReason.BIT_BUDGET_REACHED
     while len(bit_stream) < bit_budget:
-        p_LM, past, raw_logits = get_next_token_probs(context_ids, config, past=past)
+        p_LM, kv_cache, raw_logits = get_next_token_probs(context_ids, config, kv_cache=kv_cache)
 
         top_probs, top_idx = torch.topk(p_LM, config.top_k)
         top_probs = top_probs / top_probs.sum()  # renormalisation
